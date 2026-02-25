@@ -7288,6 +7288,11 @@ namespace CodeWalker
                             int geomCount = 0;
                             RunOnRenderThread((ctx) =>
                             {
+                                // Must be called every frame so the file cache's LRU clock
+                                // advances and old tile assets can be evicted to make room for
+                                // assets needed by the current tile.
+                                GameFileCache.BeginFrame();
+
                                 // Set camera for this tile (1 pixel == 1 world unit).
                                 camEntity.Position = new SharpDX.Vector3(camX, camY, 0f);
                                 camera.OrthographicSize = tileH;
@@ -7334,6 +7339,8 @@ namespace CodeWalker
                         // Capture the final (stable) frame.
                         RunOnRenderThread((ctx) =>
                         {
+                            GameFileCache.BeginFrame();
+
                             camEntity.Position = new SharpDX.Vector3(camX, camY, 0f);
                             camera.OrthographicSize = tileH;
                             camera.OrthographicTargetSize = tileH;
