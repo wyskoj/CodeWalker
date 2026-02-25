@@ -233,6 +233,7 @@ namespace CodeWalker
             this.ToolsMenuExtractTextures = new System.Windows.Forms.ToolStripMenuItem();
             this.ToolsMenuExtractRawFiles = new System.Windows.Forms.ToolStripMenuItem();
             this.ToolsMenuExtractShaders = new System.Windows.Forms.ToolStripMenuItem();
+            this.ToolsMenuExportMap = new System.Windows.Forms.ToolStripMenuItem();
             this.ToolsMenuOptions = new System.Windows.Forms.ToolStripMenuItem();
             this.ToolbarPanel = new System.Windows.Forms.Panel();
             this.Toolbar = new CodeWalker.WinForms.ToolStripFix();
@@ -2762,9 +2763,10 @@ namespace CodeWalker
             this.ToolsMenuExtractTextures,
             this.ToolsMenuExtractRawFiles,
             this.ToolsMenuExtractShaders,
+            this.ToolsMenuExportMap,
             this.ToolsMenuOptions});
             this.ToolsMenu.Name = "ToolsMenu";
-            this.ToolsMenu.Size = new System.Drawing.Size(171, 356);
+            this.ToolsMenu.Size = new System.Drawing.Size(171, 378);
             // 
             // ToolsMenuConfigureGame
             // 
@@ -2876,6 +2878,13 @@ namespace CodeWalker
             this.ToolsMenuExtractShaders.Size = new System.Drawing.Size(170, 22);
             this.ToolsMenuExtractShaders.Text = "Extract shaders...";
             this.ToolsMenuExtractShaders.Click += new System.EventHandler(this.ToolsMenuExtractShaders_Click);
+            // 
+            // ToolsMenuExportMap
+            // 
+            this.ToolsMenuExportMap.Name = "ToolsMenuExportMap";
+            this.ToolsMenuExportMap.Size = new System.Drawing.Size(170, 22);
+            this.ToolsMenuExportMap.Text = "Export Map as TIFF...";
+            this.ToolsMenuExportMap.Click += new System.EventHandler(this.ToolsMenuExportMap_Click);
             // 
             // ToolsMenuOptions
             // 
@@ -3772,6 +3781,7 @@ namespace CodeWalker
         private System.Windows.Forms.ToolStripMenuItem ToolsMenuExtractTextures;
         private System.Windows.Forms.ToolStripMenuItem ToolsMenuExtractRawFiles;
         private System.Windows.Forms.ToolStripMenuItem ToolsMenuExtractShaders;
+        private System.Windows.Forms.ToolStripMenuItem ToolsMenuExportMap;
         private System.Windows.Forms.Button AboutButton;
         private System.Windows.Forms.CheckBox ShadowsCheckBox;
         private System.Windows.Forms.CheckBox StatusBarCheckBox;

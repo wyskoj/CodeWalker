@@ -31,6 +31,10 @@ namespace CodeWalker
         volatile bool pauserendering = false;
         volatile bool initialised = false;
 
+        // Export map state (for render-thread-safe tile capture)
+        private volatile Action<DeviceContext> exportRenderAction = null;
+        private volatile bool exportRenderActionDone = false;
+
         Stopwatch frametimer = new Stopwatch();
         Space space = new Space();
         Camera camera;
@@ -398,6 +402,16 @@ namespace CodeWalker
         }
         public void RenderScene(DeviceContext context)
         {
+            // Export render action takes priority – executes in the render thread and bypasses normal rendering.
+            var exportAct = exportRenderAction;
+            if (exportAct != null)
+            {
+                exportRenderAction = null;
+                exportAct(context);
+                exportRenderActionDone = true;
+                return;
+            }
+
             float elapsed = (float)frametimer.Elapsed.TotalSeconds;
             frametimer.Restart();
 
@@ -7116,6 +7130,373 @@ namespace CodeWalker
         private void ToolsMenuOptions_Click(object sender, EventArgs e)
         {
             ShowSettingsForm();
+        }
+
+        private void ToolsMenuExportMap_Click(object sender, EventArgs e)
+        {
+            ExportMapAsTiff();
+        }
+
+        private void ExportMapAsTiff()
+        {
+            if (!renderworld)
+            {
+                MessageBox.Show("Please enable World view mode before exporting the map.", "Export Map as TIFF");
+                return;
+            }
+            if (!initialised)
+            {
+                MessageBox.Show("Please wait for game files to finish loading before exporting.", "Export Map as TIFF");
+                return;
+            }
+
+            var sfd = new SaveFileDialog();
+            sfd.Filter = "TIFF Image (*.tif)|*.tif|TIFF Image (*.tiff)|*.tiff|All Files (*.*)|*.*";
+            sfd.FileName = "world_map.tif";
+            sfd.Title = "Export Map as TIFF";
+            if (sfd.ShowDialog() != DialogResult.OK) return;
+
+            string outputPath = sfd.FileName;
+
+            ToolsMenuExportMap.Enabled = false;
+            pauserendering = true;
+
+            Task.Run(() =>
+            {
+                try
+                {
+                    ExportMapTask(outputPath);
+                    Invoke(new Action(() =>
+                    {
+                        MessageBox.Show("Map exported successfully:\n" + outputPath, "Export Map as TIFF");
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    Invoke(new Action(() =>
+                    {
+                        MessageBox.Show("Export failed:\n" + ex.Message, "Export Map as TIFF - Error");
+                    }));
+                }
+                finally
+                {
+                    pauserendering = false;
+                    Invoke(new Action(() =>
+                    {
+                        ToolsMenuExportMap.Enabled = true;
+                    }));
+                }
+            });
+        }
+
+        // Queues an action to run on the render thread and waits for it to complete.
+        private void RunOnRenderThread(Action<DeviceContext> action, int timeoutMs = 10000)
+        {
+            exportRenderActionDone = false;
+            exportRenderAction = action;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (!exportRenderActionDone && sw.ElapsedMilliseconds < timeoutMs)
+            {
+                System.Threading.Thread.Sleep(5);
+            }
+        }
+
+        private void ExportMapTask(string outputPath)
+        {
+            // World bounds (GTA V standard)
+            const float WorldMinX = -4050f;
+            const float WorldMinY = -4050f;
+            const float WorldMaxY = 8400f;
+            const int OutputWidth = 9150;   // WorldMaxX - WorldMinX = 5100 - (-4050)
+            const int OutputHeight = 12450; // WorldMaxY - WorldMinY = 8400 - (-4050)
+
+            // Read backbuffer dimensions on the render thread.
+            int tileW = 0, tileH = 0, sampleCount = 0;
+            RunOnRenderThread((ctx) =>
+            {
+                var desc = Renderer.DXMan.backbuffer.Description;
+                tileW = desc.Width;
+                tileH = desc.Height;
+                sampleCount = desc.SampleDescription.Count;
+            });
+
+            if (tileW == 0 || tileH == 0)
+                throw new Exception("Could not read backbuffer dimensions.");
+
+            int tilesX = (int)Math.Ceiling((double)OutputWidth / tileW);
+            int tilesY = (int)Math.Ceiling((double)OutputHeight / tileH);
+            int totalTiles = tilesX * tilesY;
+            int tileIndex = 0;
+
+            // Allocate output buffer (RGB24).
+            byte[] outputPixels = new byte[OutputWidth * OutputHeight * 3];
+
+            // Save camera/renderer state.
+            var savedCamPos = camEntity.Position;
+            float savedOrthoSize = camera.OrthographicSize;
+            float savedOrthoTargetSize = camera.OrthographicTargetSize;
+            float savedAspectRatio = camera.AspectRatio;
+            float savedWidth = camera.Width;
+            float savedHeight = camera.Height;
+            bool savedMapViewEnabled = Renderer.MapViewEnabled;
+            bool savedIsMapView = camera.IsMapView;
+            bool savedIsOrtho = camera.IsOrthographic;
+            float savedMapViewDetail = Renderer.MapViewDetail;
+
+            try
+            {
+                // Enable map-view orthographic mode for export.
+                Renderer.MapViewEnabled = true;
+                camera.IsMapView = true;
+                camera.IsOrthographic = true;
+
+                // Force maximum LOD detail during export.
+                // LOD visibility uses: dist = camera.OrthographicSize / MapViewDetail.
+                // With MapViewDetail = 1.0 (default) and OrthographicSize = tileH,
+                // dist ≈ tileH (e.g. 711) which exceeds every HD entity's loddist (~100),
+                // so ORPHANHD (highest-detail) entities are never selected or queued.
+                // Setting MapViewDetail = tileH makes dist = 1.0, which is below every
+                // entity's loddist, forcing the engine to recurse to and load HD meshes.
+                Renderer.MapViewDetail = (float)tileH;
+
+                for (int row = 0; row < tilesY; row++)
+                {
+                    for (int col = 0; col < tilesX; col++)
+                    {
+                        tileIndex++;
+                        UpdateStatus($"Exporting map tile {tileIndex}/{totalTiles}...");
+
+                        // World-space centre of this tile.
+                        float camX = WorldMinX + (col + 0.5f) * tileW;
+                        float camY = WorldMaxY - (row + 0.5f) * tileH;
+
+                        byte[] tilePixels = null;
+
+                        // Render frames until the LOD/asset queues drain and geometry count stabilises,
+                        // then capture.  Each iteration: render → sleep to give the content threads
+                        // time to process their work queues → check stability.
+                        const int MaxWarmupMs = 30000; // hard ceiling: 30 s per tile
+                        const int MinWarmupMs = 5000;  // minimum wait even if queues look empty
+                        const int SleepPerFrameMs = 100;
+                        const int StableFramesRequired = 3;
+                        int stableFrames = 0;
+                        int lastGeomCount = -1;
+                        var warmupTimer = System.Diagnostics.Stopwatch.StartNew();
+
+                        while (warmupTimer.ElapsedMilliseconds < MaxWarmupMs)
+                        {
+                            int geomCount = 0;
+                            RunOnRenderThread((ctx) =>
+                            {
+                                // Must be called every frame so the file cache's LRU clock
+                                // advances and old tile assets can be evicted to make room for
+                                // assets needed by the current tile.
+                                GameFileCache.BeginFrame();
+
+                                // Set camera for this tile (1 pixel == 1 world unit).
+                                camEntity.Position = new SharpDX.Vector3(camX, camY, 0f);
+                                camera.OrthographicSize = tileH;
+                                camera.OrthographicTargetSize = tileH;
+                                camera.AspectRatio = (float)tileW / tileH;
+                                camera.Width = tileW;
+                                camera.Height = tileH;
+                                camera.UpdateProj = true;
+
+                                // Full render pass.
+                                Renderer.Update(0.016f, 0, 0);
+                                Renderer.BeginRender(ctx);
+                                Renderer.RenderSkyAndClouds();
+                                Renderer.SelectedDrawable = SelectedItem.Drawable;
+                                RenderWorld();
+                                Renderer.RenderQueued();
+                                Renderer.RenderFinalPass();
+                                Renderer.EndRender();
+
+                                geomCount = Renderer.shaders?.RenderedGeometries ?? 0;
+                            });
+
+                            // Give the content threads (file cache + renderable cache) time to
+                            // process the asset requests that were triggered by the render above.
+                            System.Threading.Thread.Sleep(SleepPerFrameMs);
+
+                            // Check whether both work queues are empty AND the geometry count has
+                            // stopped changing – that is our signal that all LODs have loaded.
+                            // Also enforce a minimum wait so we don't exit during a brief
+                            // between-LOD gap where the queue is transiently zero.
+                            bool queuesEmpty = (GameFileCache.QueueLength == 0)
+                                           && (Renderer.RenderableCache.TotalQueueLength == 0);
+                            bool pastMinWait = warmupTimer.ElapsedMilliseconds >= MinWarmupMs;
+                            if (queuesEmpty && geomCount == lastGeomCount && pastMinWait)
+                                stableFrames++;
+                            else
+                                stableFrames = 0;
+                            lastGeomCount = geomCount;
+
+                            if (stableFrames >= StableFramesRequired)
+                                break;
+                        }
+
+                        // Capture the final (stable) frame.
+                        RunOnRenderThread((ctx) =>
+                        {
+                            GameFileCache.BeginFrame();
+
+                            camEntity.Position = new SharpDX.Vector3(camX, camY, 0f);
+                            camera.OrthographicSize = tileH;
+                            camera.OrthographicTargetSize = tileH;
+                            camera.AspectRatio = (float)tileW / tileH;
+                            camera.Width = tileW;
+                            camera.Height = tileH;
+                            camera.UpdateProj = true;
+
+                            Renderer.Update(0.016f, 0, 0);
+                            Renderer.BeginRender(ctx);
+                            Renderer.RenderSkyAndClouds();
+                            Renderer.SelectedDrawable = SelectedItem.Drawable;
+                            RenderWorld();
+                            Renderer.RenderQueued();
+                            Renderer.RenderFinalPass();
+                            Renderer.EndRender();
+
+                            tilePixels = CaptureBackbufferPixels(ctx, tileW, tileH, sampleCount);
+                        });
+
+                        if (tilePixels == null) continue;
+
+                        // Copy tile pixels into the output buffer.
+                        // Backbuffer format is R8G8B8A8_UNorm, so in memory: R=src[0], G=src[1], B=src[2].
+                        int outX0 = col * tileW;
+                        int outY0 = row * tileH;
+                        for (int py = 0; py < tileH; py++)
+                        {
+                            int outY = outY0 + py;
+                            if (outY >= OutputHeight) break;
+                            for (int px = 0; px < tileW; px++)
+                            {
+                                int outX = outX0 + px;
+                                if (outX >= OutputWidth) break;
+                                int src = (py * tileW + px) * 4;
+                                int dst = (outY * OutputWidth + outX) * 3;
+                                outputPixels[dst + 0] = tilePixels[src + 0]; // R
+                                outputPixels[dst + 1] = tilePixels[src + 1]; // G
+                                outputPixels[dst + 2] = tilePixels[src + 2]; // B
+                            }
+                        }
+                    }
+                }
+
+                UpdateStatus("Saving TIFF...");
+                SaveTiffImage(outputPath, outputPixels, OutputWidth, OutputHeight);
+                UpdateStatus("Export complete: " + outputPath);
+            }
+            finally
+            {
+                // Restore camera/renderer state on the render thread.
+                RunOnRenderThread((ctx) =>
+                {
+                    camEntity.Position = savedCamPos;
+                    camera.OrthographicSize = savedOrthoSize;
+                    camera.OrthographicTargetSize = savedOrthoTargetSize;
+                    camera.AspectRatio = savedAspectRatio;
+                    camera.Width = savedWidth;
+                    camera.Height = savedHeight;
+                    camera.UpdateProj = true;
+                    Renderer.MapViewEnabled = savedMapViewEnabled;
+                    camera.IsMapView = savedIsMapView;
+                    camera.IsOrthographic = savedIsOrtho;
+                    Renderer.MapViewDetail = savedMapViewDetail;
+                });
+            }
+        }
+
+        private byte[] CaptureBackbufferPixels(DeviceContext ctx, int width, int height, int sampleCount)
+        {
+            var device = Renderer.Device;
+            var backbuffer = Renderer.DXMan.backbuffer;
+
+            var resolveDesc = new SharpDX.Direct3D11.Texture2DDescription
+            {
+                Width = width,
+                Height = height,
+                MipLevels = 1,
+                ArraySize = 1,
+                Format = SharpDX.DXGI.Format.R8G8B8A8_UNorm,
+                SampleDescription = new SharpDX.DXGI.SampleDescription(1, 0),
+                Usage = SharpDX.Direct3D11.ResourceUsage.Default,
+                BindFlags = SharpDX.Direct3D11.BindFlags.RenderTarget,
+                CpuAccessFlags = SharpDX.Direct3D11.CpuAccessFlags.None,
+                OptionFlags = SharpDX.Direct3D11.ResourceOptionFlags.None
+            };
+            var stagingDesc = new SharpDX.Direct3D11.Texture2DDescription
+            {
+                Width = width,
+                Height = height,
+                MipLevels = 1,
+                ArraySize = 1,
+                Format = SharpDX.DXGI.Format.R8G8B8A8_UNorm,
+                SampleDescription = new SharpDX.DXGI.SampleDescription(1, 0),
+                Usage = SharpDX.Direct3D11.ResourceUsage.Staging,
+                BindFlags = SharpDX.Direct3D11.BindFlags.None,
+                CpuAccessFlags = SharpDX.Direct3D11.CpuAccessFlags.Read,
+                OptionFlags = SharpDX.Direct3D11.ResourceOptionFlags.None
+            };
+
+            byte[] pixels = new byte[width * height * 4];
+
+            using (var stagingTex = new SharpDX.Direct3D11.Texture2D(device, stagingDesc))
+            {
+                if (sampleCount > 1)
+                {
+                    using (var resolvedTex = new SharpDX.Direct3D11.Texture2D(device, resolveDesc))
+                    {
+                        ctx.ResolveSubresource(backbuffer, 0, resolvedTex, 0, SharpDX.DXGI.Format.R8G8B8A8_UNorm);
+                        ctx.CopyResource(resolvedTex, stagingTex);
+                    }
+                }
+                else
+                {
+                    ctx.CopyResource(backbuffer, stagingTex);
+                }
+
+                var dataBox = ctx.MapSubresource(stagingTex, 0, SharpDX.Direct3D11.MapMode.Read, SharpDX.Direct3D11.MapFlags.None);
+                try
+                {
+                    int rowPitch = dataBox.RowPitch;
+                    for (int y = 0; y < height; y++)
+                    {
+                        System.Runtime.InteropServices.Marshal.Copy(
+                            IntPtr.Add(dataBox.DataPointer, y * rowPitch),
+                            pixels, y * width * 4, width * 4);
+                    }
+                }
+                finally
+                {
+                    ctx.UnmapSubresource(stagingTex, 0);
+                }
+            }
+
+            return pixels;
+        }
+
+        private void SaveTiffImage(string path, byte[] rgbPixels, int width, int height)
+        {
+            int stride = width * 3;
+            var bitmapSource = System.Windows.Media.Imaging.BitmapSource.Create(
+                width, height,
+                96, 96,
+                System.Windows.Media.PixelFormats.Rgb24,
+                null,
+                rgbPixels,
+                stride);
+
+            var encoder = new System.Windows.Media.Imaging.TiffBitmapEncoder();
+            encoder.Compression = System.Windows.Media.Imaging.TiffCompressOption.None;
+            encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bitmapSource));
+
+            using (var stream = new System.IO.FileStream(path, System.IO.FileMode.Create, System.IO.FileAccess.Write))
+            {
+                encoder.Save(stream);
+            }
         }
 
         private void StatusBarCheckBox_CheckedChanged(object sender, EventArgs e)
