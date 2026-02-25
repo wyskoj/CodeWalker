@@ -7241,6 +7241,7 @@ namespace CodeWalker
             bool savedMapViewEnabled = Renderer.MapViewEnabled;
             bool savedIsMapView = camera.IsMapView;
             bool savedIsOrtho = camera.IsOrthographic;
+            float savedMapViewDetail = Renderer.MapViewDetail;
 
             try
             {
@@ -7248,6 +7249,15 @@ namespace CodeWalker
                 Renderer.MapViewEnabled = true;
                 camera.IsMapView = true;
                 camera.IsOrthographic = true;
+
+                // Force maximum LOD detail during export.
+                // LOD visibility uses: dist = camera.OrthographicSize / MapViewDetail.
+                // With MapViewDetail = 1.0 (default) and OrthographicSize = tileH,
+                // dist ≈ tileH (e.g. 711) which exceeds every HD entity's loddist (~100),
+                // so ORPHANHD (highest-detail) entities are never selected or queued.
+                // Setting MapViewDetail = tileH makes dist = 1.0, which is below every
+                // entity's loddist, forcing the engine to recurse to and load HD meshes.
+                Renderer.MapViewDetail = (float)tileH;
 
                 for (int row = 0; row < tilesY; row++)
                 {
@@ -7266,6 +7276,7 @@ namespace CodeWalker
                         // then capture.  Each iteration: render → sleep to give the content threads
                         // time to process their work queues → check stability.
                         const int MaxWarmupMs = 30000; // hard ceiling: 30 s per tile
+                        const int MinWarmupMs = 5000;  // minimum wait even if queues look empty
                         const int SleepPerFrameMs = 100;
                         const int StableFramesRequired = 3;
                         int stableFrames = 0;
@@ -7305,9 +7316,12 @@ namespace CodeWalker
 
                             // Check whether both work queues are empty AND the geometry count has
                             // stopped changing – that is our signal that all LODs have loaded.
+                            // Also enforce a minimum wait so we don't exit during a brief
+                            // between-LOD gap where the queue is transiently zero.
                             bool queuesEmpty = (GameFileCache.QueueLength == 0)
                                            && (Renderer.RenderableCache.TotalQueueLength == 0);
-                            if (queuesEmpty && geomCount == lastGeomCount)
+                            bool pastMinWait = warmupTimer.ElapsedMilliseconds >= MinWarmupMs;
+                            if (queuesEmpty && geomCount == lastGeomCount && pastMinWait)
                                 stableFrames++;
                             else
                                 stableFrames = 0;
@@ -7383,6 +7397,7 @@ namespace CodeWalker
                     Renderer.MapViewEnabled = savedMapViewEnabled;
                     camera.IsMapView = savedIsMapView;
                     camera.IsOrthographic = savedIsOrtho;
+                    Renderer.MapViewDetail = savedMapViewDetail;
                 });
             }
         }
