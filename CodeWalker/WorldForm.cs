@@ -7262,10 +7262,19 @@ namespace CodeWalker
 
                         byte[] tilePixels = null;
 
-                        // Render two warmup frames so assets have time to load, then capture.
-                        for (int pass = 0; pass < 3; pass++)
+                        // Render frames until the LOD/asset queues drain and geometry count stabilises,
+                        // then capture.  Each iteration: render → sleep to give the content threads
+                        // time to process their work queues → check stability.
+                        const int MaxWarmupMs = 30000; // hard ceiling: 30 s per tile
+                        const int SleepPerFrameMs = 100;
+                        const int StableFramesRequired = 3;
+                        int stableFrames = 0;
+                        int lastGeomCount = -1;
+                        var warmupTimer = System.Diagnostics.Stopwatch.StartNew();
+
+                        while (warmupTimer.ElapsedMilliseconds < MaxWarmupMs)
                         {
-                            bool capture = (pass == 2);
+                            int geomCount = 0;
                             RunOnRenderThread((ctx) =>
                             {
                                 // Set camera for this tile (1 pixel == 1 world unit).
@@ -7287,17 +7296,54 @@ namespace CodeWalker
                                 Renderer.RenderFinalPass();
                                 Renderer.EndRender();
 
-                                if (capture)
-                                {
-                                    tilePixels = CaptureBackbufferPixels(ctx, tileW, tileH, sampleCount);
-                                }
+                                geomCount = Renderer.shaders?.RenderedGeometries ?? 0;
                             });
+
+                            // Give the content threads (file cache + renderable cache) time to
+                            // process the asset requests that were triggered by the render above.
+                            System.Threading.Thread.Sleep(SleepPerFrameMs);
+
+                            // Check whether both work queues are empty AND the geometry count has
+                            // stopped changing – that is our signal that all LODs have loaded.
+                            bool queuesEmpty = (GameFileCache.QueueLength == 0)
+                                           && (Renderer.RenderableCache.TotalQueueLength == 0);
+                            if (queuesEmpty && geomCount == lastGeomCount)
+                                stableFrames++;
+                            else
+                                stableFrames = 0;
+                            lastGeomCount = geomCount;
+
+                            if (stableFrames >= StableFramesRequired)
+                                break;
                         }
+
+                        // Capture the final (stable) frame.
+                        RunOnRenderThread((ctx) =>
+                        {
+                            camEntity.Position = new SharpDX.Vector3(camX, camY, 0f);
+                            camera.OrthographicSize = tileH;
+                            camera.OrthographicTargetSize = tileH;
+                            camera.AspectRatio = (float)tileW / tileH;
+                            camera.Width = tileW;
+                            camera.Height = tileH;
+                            camera.UpdateProj = true;
+
+                            Renderer.Update(0.016f, 0, 0);
+                            Renderer.BeginRender(ctx);
+                            Renderer.RenderSkyAndClouds();
+                            Renderer.SelectedDrawable = SelectedItem.Drawable;
+                            RenderWorld();
+                            Renderer.RenderQueued();
+                            Renderer.RenderFinalPass();
+                            Renderer.EndRender();
+
+                            tilePixels = CaptureBackbufferPixels(ctx, tileW, tileH, sampleCount);
+                        });
 
                         if (tilePixels == null) continue;
 
                         // Copy tile pixels into the output buffer.
-                        // Backbuffer pixel order is BGRA; output is RGB24.
+                        // Backbuffer format is R8G8B8A8_UNorm, so in memory: R=src[0], G=src[1], B=src[2].
                         int outX0 = col * tileW;
                         int outY0 = row * tileH;
                         for (int py = 0; py < tileH; py++)
@@ -7310,9 +7356,9 @@ namespace CodeWalker
                                 if (outX >= OutputWidth) break;
                                 int src = (py * tileW + px) * 4;
                                 int dst = (outY * OutputWidth + outX) * 3;
-                                outputPixels[dst + 0] = tilePixels[src + 2]; // R
+                                outputPixels[dst + 0] = tilePixels[src + 0]; // R
                                 outputPixels[dst + 1] = tilePixels[src + 1]; // G
-                                outputPixels[dst + 2] = tilePixels[src + 0]; // B
+                                outputPixels[dst + 2] = tilePixels[src + 2]; // B
                             }
                         }
                     }
